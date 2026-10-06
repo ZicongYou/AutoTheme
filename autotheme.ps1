@@ -14,6 +14,7 @@ $LocationRefreshMin = 60  # 多久重新定位一次
 $ErrorActionPreference = 'Stop'
 $LogFile  = Join-Path $PSScriptRoot 'autotheme.log'
 $LocFile  = Join-Path $PSScriptRoot 'location.json'
+$StateFile = Join-Path $PSScriptRoot 'state.json'
 
 function Write-Log($msg) {
     $line = "{0:yyyy-MM-dd HH:mm:ss}  {1}" -f (Get-Date), $msg
@@ -129,16 +130,8 @@ function Get-SunEvent([datetime]$Date, [bool]$Rise) {
     return $local
 }
 
-function Set-Theme([bool]$Light) {
-    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
-    $want = [int]$Light
-    $cur = Get-ItemProperty $key -ErrorAction SilentlyContinue
-    if ($cur.AppsUseLightTheme -eq $want -and $cur.SystemUsesLightTheme -eq $want) { return $false }
-
-    Set-ItemProperty $key -Name AppsUseLightTheme    -Value $want -Type DWord
-    Set-ItemProperty $key -Name SystemUsesLightTheme -Value $want -Type DWord
-
-    # 广播设置变化，任务栏/资源管理器/应用立即刷新
+# 广播设置变化，让任务栏/开始菜单/资源管理器/应用重新读取颜色。内容没变时重发不会有可见变化
+function Send-ThemeRefresh {
     if (-not ('AutoTheme.Native' -as [type])) {
         Add-Type -Namespace AutoTheme -Name Native -MemberDefinition @'
 [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -149,8 +142,33 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
     foreach ($p in 'ImmersiveColorSet', 'WindowsThemeElement') {
         [void][AutoTheme.Native]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, $p, 2, 3000, [ref]$r)
     }
+}
+
+# 锁屏界面在当前会话里运行 = 屏幕锁着，此时桌面组件常常收不到刷新通知
+function Test-Locked {
+    $sid = (Get-Process -Id $PID).SessionId
+    [bool](Get-Process LogonUI -ErrorAction SilentlyContinue | Where-Object SessionId -eq $sid)
+}
+
+# 只写注册表，返回是否真的改了
+function Set-Theme([bool]$Light) {
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+    $want = [int]$Light
+    $cur = Get-ItemProperty $key -ErrorAction SilentlyContinue
+    if ($cur.AppsUseLightTheme -eq $want -and $cur.SystemUsesLightTheme -eq $want) { return $false }
+    Set-ItemProperty $key -Name AppsUseLightTheme    -Value $want -Type DWord
+    Set-ItemProperty $key -Name SystemUsesLightTheme -Value $want -Type DWord
     return $true
 }
+
+# state.json：RefreshUntil 切换后补发刷新的截止时间；Pending 切换时屏幕锁着，解锁后要补发
+function Get-State {
+    $s = $null
+    if (Test-Path $StateFile) { try { $s = Get-Content $StateFile -Raw | ConvertFrom-Json } catch {} }
+    if (-not $s) { $s = [pscustomobject]@{ RefreshUntil = $null; Pending = $false } }
+    return $s
+}
+function Save-State($s) { $s | ConvertTo-Json | Set-Content $StateFile }
 
 try {
     $now = Get-Date
@@ -171,8 +189,30 @@ try {
         $light = ($now -ge $rise) -and ($now -lt $set)
         $why = "日出 {0:HH:mm} 日落 {1:HH:mm}，位置来源：{2}" -f $rise, $set, $loc.Src
     }
+
+    $state = Get-State
+    $locked = Test-Locked
     if (Set-Theme $light) {
-        Write-Log ("切换到{0}（{1}）" -f $(if ($light) { '浅色' } else { '深色' }), $why)
+        Write-Log ("切换到{0}（{1}）{2}" -f $(if ($light) { '浅色' } else { '深色' }), $why, $(if ($locked) { '，锁屏中，解锁后补刷新' } else { '' }))
+        Send-ThemeRefresh
+        $state.RefreshUntil = $now.AddMinutes(15).ToString('o')
+        $state.Pending = $locked
+        Save-State $state
+        # 刚切换时部分组件还在重绘，几秒后再发一次
+        if (-not $locked) { Start-Sleep 4; Send-ThemeRefresh }
+    } elseif ($state.Pending) {
+        # 解锁触发时锁屏界面可能还没退，最多等 15 秒
+        for ($i = 0; $i -lt 15 -and $locked; $i++) { Start-Sleep 1; $locked = Test-Locked }
+        if (-not $locked) {
+            Start-Sleep 2
+            Send-ThemeRefresh; Start-Sleep 4; Send-ThemeRefresh
+            $state.Pending = $false
+            $state.RefreshUntil = (Get-Date).AddMinutes(15).ToString('o')
+            Save-State $state
+            Write-Log "解锁后补发刷新"
+        }
+    } elseif ($state.RefreshUntil -and $now -lt [datetime]$state.RefreshUntil -and -not $locked) {
+        Send-ThemeRefresh
     }
 } catch {
     Write-Log "出错: $_"
