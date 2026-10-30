@@ -213,8 +213,8 @@ try {
         $state.RefreshUntil = $now.AddMinutes(15).ToString('o')
         $state.Pending = $locked
         Save-State $state
-        # 刚切换时部分组件还在重绘，几秒后再发一次
-        if (-not $locked) { Start-Sleep 4; Send-ThemeRefresh }
+        # 任务栏有时只换一半（底色没跟上），等其他部件换完后逼它重画一次
+        if (-not $locked) { Start-Sleep 3; Repair-Taskbar }
     } elseif ($state.Pending) {
         # 解锁触发时锁屏界面可能还没退，最多等 15 秒
         for ($i = 0; $i -lt 15 -and $locked; $i++) { Start-Sleep 1; $locked = Test-Locked }
