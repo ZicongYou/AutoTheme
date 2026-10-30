@@ -144,6 +144,21 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
     }
 }
 
+# 任务栏只认注册表值的变化，不认广播：锁屏时错过了变化就会一直停在旧颜色。
+# 把 SystemUsesLightTheme 来回改一次，人为制造变化逼它重画（任务栏会闪一下）
+function Repair-Taskbar {
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+    $want = [int](Get-ItemProperty $key).SystemUsesLightTheme
+    try {
+        Set-ItemProperty $key -Name SystemUsesLightTheme -Value (1 - $want) -Type DWord
+        Send-ThemeRefresh
+        Start-Sleep -Milliseconds 1500
+    } finally {
+        Set-ItemProperty $key -Name SystemUsesLightTheme -Value $want -Type DWord
+        Send-ThemeRefresh
+    }
+}
+
 # 锁屏界面在当前会话里运行 = 屏幕锁着，此时桌面组件常常收不到刷新通知
 function Test-Locked {
     $sid = (Get-Process -Id $PID).SessionId
@@ -204,12 +219,12 @@ try {
         # 解锁触发时锁屏界面可能还没退，最多等 15 秒
         for ($i = 0; $i -lt 15 -and $locked; $i++) { Start-Sleep 1; $locked = Test-Locked }
         if (-not $locked) {
-            Start-Sleep 2
-            Send-ThemeRefresh; Start-Sleep 4; Send-ThemeRefresh
+            Start-Sleep 5
+            Repair-Taskbar
             $state.Pending = $false
             $state.RefreshUntil = (Get-Date).AddMinutes(15).ToString('o')
             Save-State $state
-            Write-Log "解锁后补发刷新"
+            Write-Log "解锁后重画任务栏"
         }
     } elseif ($state.RefreshUntil -and $now -lt [datetime]$state.RefreshUntil -and -not $locked) {
         Send-ThemeRefresh
